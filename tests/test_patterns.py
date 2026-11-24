@@ -62,15 +62,16 @@ def test_inside_pin_bar_treated_as_inside():
     assert best.kind == "inside"
 
 
-def test_pin_vs_opposite_engulfing_conflict():
+def test_pin_vs_opposite_engulfing_pin_wins():
+    # Свеча перекрыла предыдущую, но у неё крошечное тело и длинный нижний шип: это пин-бар на покупку,
+    # а не поглощение на продажу
     d = df_of([(100, 101, 99.5, 100.6), (100.9, 101.2, 97, 100.7)])
     pats = P.detect(d, 1)
     kinds = {(p.kind, p.direction) for p in pats}
-    assert ("engulfing", -1) in kinds and ("pin", 1) in kinds
+    assert ("engulfing", -1) not in kinds and ("pin", 1) in kinds
     best, why = P.select(pats, 1)
-    assert best is None and "конфликт" in why
-    best, why = P.select(pats, -1)
-    assert best.kind == "engulfing"
+    assert best.kind == "pin" and why is None
+    assert P.select(pats, -1) == (None, None)
 
 
 def test_zone_deleted_on_close_beyond():

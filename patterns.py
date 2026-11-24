@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+import config as C
+
 NAMES = {
     "pin": "Пин-бар",
     "engulfing": "Поглощение",
@@ -51,6 +53,14 @@ def pin_bar(c):
 
 def engulfing(c1, c2):
     if not (c2.high > c1.high and c2.low < c1.low):
+        return None
+    rng = c2.high - c2.low
+    # Крошечное тело: на другой бирже эта свеча могла быть противоположного цвета, сигнал ненадёжен
+    if rng <= 0 or abs(c2.close - c2.open) < C.ENGULF_MIN_BODY * rng:
+        return None
+    # Длинный шип против направления поглощения: это скорее пин-бар в другую сторону
+    pin = pin_bar(c2)
+    if pin is not None and pin.direction == (-1 if c2.close > c2.open else 1):
         return None
     if c2.close > c2.open:
         strong = c2.close > c1.open

@@ -5,7 +5,7 @@ import pandas as pd
 
 import config as C
 from patterns import NAMES, detect, resolve, select
-from swings import swing_points, trend_break, trend_of
+from swings import leg_origin, swing_points, trend_break, trend_of
 
 MSK = timezone(timedelta(hours=3))
 TF_LABEL = {"1h": "1H", "15m": "15m"}
@@ -215,6 +215,10 @@ def _fill(state, it, tf, c, t, ctf=None):
     return events, trade
 
 
+def _fakey_against_now(df, d):
+    return any(p.kind == "fakey" and p.direction == -d for p in detect(df, len(df) - 1))
+
+
 def follow_pending(df, state, tf):
     events, keep = [], []
     i = len(df) - 1
@@ -253,6 +257,14 @@ def follow_pending(df, state, tf):
                     {"entry": it["entry"], "stop": it["stop"]}, (t, t)))
                 continue
         triggered = c.high >= it["entry"] if it["trigger"] == "above" else c.low <= it["entry"]
+        if triggered and it["kind"] == "inside" and _fakey_against_now(df, d):
+            events.append(Event(
+                "cancel", tf,
+                f"ETHUSDT · {TF_LABEL[tf]} · ОТМЕНА ВХОДА ({NAMES[it['kind']]} {on_side(d)})\n"
+                f"Лимитка {fmt(it['entry'])} коснулась цены, но на этой свече сформировался фейк против направления. Вход не открываю.\n"
+                f"{candle_time(t, tf)}",
+                {"entry": it["entry"], "stop": it["stop"]}, (t, t)))
+            continue
         if triggered:
             ev, trade = _fill(state, it, tf, c, t)
             events += ev
@@ -503,6 +515,42 @@ def follow_active(df, state, tf):
     return events
 
 
+def _pullback(df, highs, lows, d, i):
+    """Откат к тренду d после последней swing-точки.
+    Возвращает (None, None), если сигнала быть не может; ("broken", None), если откат ушёл ниже начала
+    последней волны (тренд сломан); ("ok", (bv, ext, pull, depth)) иначе."""
+    h, l = df.high.values, df.low.values
+    if d > 0:
+        if not highs:
+            return None, None
+        hp, ext = highs[-1]
+        base = [x for x in lows if x[0] < hp]
+        if not base or hp >= i:
+            return None, None
+        bi, bv = base[-1]
+        since_h, since_l = h[hp + 1:i + 1], l[hp + 1:i + 1]
+        if since_h.max() > ext:
+            return None, None
+        pull = since_l.min()
+        if pull <= leg_origin(df, hp, bi, bv, True, C.LEG_DIP_MULT, C.LEG_LOOKBACK):
+            return "broken", None
+        return "ok", (bv, ext, pull, (ext - pull) / (ext - bv))
+    if not lows:
+        return None, None
+    lp, ext = lows[-1]
+    base = [x for x in highs if x[0] < lp]
+    if not base or lp >= i:
+        return None, None
+    bi, bv = base[-1]
+    since_h, since_l = h[lp + 1:i + 1], l[lp + 1:i + 1]
+    if since_l.min() < ext:
+        return None, None
+    pull = since_h.max()
+    if pull >= leg_origin(df, lp, bi, bv, False, C.LEG_DIP_MULT, C.LEG_LOOKBACK):
+        return "broken", None
+    return "ok", (bv, ext, pull, (pull - ext) / (bv - ext))
+
+
 def process_15m(df, state):
     events = follow_pending(df, state, "15m") + follow_active(df, state, "15m")
     i = len(df) - 1
@@ -514,36 +562,18 @@ def process_15m(df, state):
     pats = detect(df, i)
     if not pats:
         return events
+    status, info = _pullback(df, highs, lows, d, i)
+    if status == "broken":
+        # Откат пробил начало последней волны: подтверждённые swing-точки ещё показывают старый тренд,
+        # но структура уже сломана (новый минимум ниже прежнего). Работаем уже против бывшего тренда.
+        d = -d
+        status, info = _pullback(df, highs, lows, d, i)
+    if status != "ok":
+        return events
     p, _ = select(pats, d)
     if p is None:
         return events
-    h, l = df.high.values, df.low.values
-    if d > 0:
-        hp, ext = highs[-1]
-        base = [x for x in lows if x[0] < hp]
-        if not base or hp >= i:
-            return events
-        bv = base[-1][1]
-        since_h, since_l = h[hp + 1:i + 1], l[hp + 1:i + 1]
-        if since_h.max() > ext:
-            return events
-        pull = since_l.min()
-        if pull <= bv:
-            return events
-        depth = (ext - pull) / (ext - bv)
-    else:
-        lp, ext = lows[-1]
-        base = [x for x in highs if x[0] < lp]
-        if not base or lp >= i:
-            return events
-        bv = base[-1][1]
-        since_h, since_l = h[lp + 1:i + 1], l[lp + 1:i + 1]
-        if since_l.min() < ext:
-            return events
-        pull = since_h.max()
-        if pull >= bv:
-            return events
-        depth = (pull - ext) / (bv - ext)
+    bv, ext, pull, depth = info
     if depth < C.PULLBACK_MIN:
         return events
     if has_open_dir(state, d, "15m"):
@@ -551,7 +581,8 @@ def process_15m(df, state):
     entry, sref = resolve(p, d)
     if ext == pull or abs(entry - pull) / abs(ext - pull) > C.ENTRY_MAX_RETRACE:
         return events
-    stop = sref * (1 - C.STOP_BUFFER_15M) if d > 0 else sref * (1 + C.STOP_BUFFER_15M)
+    buf15 = C.STOP_BUFFER_1H if p.kind == "inside" else C.STOP_BUFFER_15M
+    stop = sref * (1 - buf15) if d > 0 else sref * (1 + buf15)
     risk = abs(entry - stop)
     if risk <= 0:
         return events
@@ -561,7 +592,7 @@ def process_15m(df, state):
         f"ETHUSDT · 15m · {side_word(d)} (по тренду)\n"
         f"Тренд: {trend_txt}, откат {depth * 100:.0f}% импульса {fmt(bv)}→{fmt(ext)}\n"
         f"Паттерн: {p.title(d)} ({p.note})\n"
-        + _levels_text(entry, stop, tp, ENTRY_HOW[p.entry_type], f"за паттерном + {C.STOP_BUFFER_15M * 100:.1f}%", f"1:{C.RR:.0f}")
+        + _levels_text(entry, stop, tp, ENTRY_HOW[p.entry_type], f"за паттерном + {buf15 * 100:.1f}%", f"1:{C.RR:.0f}")
         + f"\nВыход раньше: при развороте пришлю сигнал закрыть.\n{candle_time(t, '15m')}"
     )
     events.append(Event("entry", "15m", text, {"entry": entry, "stop": stop, "tp": tp}, _mark(df, i, p)))
